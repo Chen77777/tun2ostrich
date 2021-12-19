@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::{
     io,
     net::SocketAddr,
@@ -113,27 +114,27 @@ impl NetStackImpl {
                         inbound_tag: inbound_tag_1.clone(),
                         ..Default::default()
                     };
-
-                    if fakedns.lock().await.is_fake_ip(&stream.remote_addr().ip()) {
-                        if let Some(domain) = fakedns
-                            .lock()
-                            .await
-                            .query_domain(&stream.remote_addr().ip())
-                        {
-                            sess.destination =
-                                SocksAddr::Domain(domain, stream.remote_addr().port());
-                        } else {
-                            // Although requests targeting fake IPs are assumed
-                            // never happen in real network traffic, which are
-                            // likely caused by poisoned DNS cache records, we
-                            // still have a chance to sniff the request domain
-                            // for TLS traffic in dispatcher.
-                            if stream.remote_addr().port() != 443 {
-                                return;
+                    {
+                        let mut fake_dns = fakedns.lock().await;
+                        if fake_dns.is_fake_ip(&stream.remote_addr().ip()) {
+                            match fake_dns.query_domain(&stream.remote_addr().ip()) {
+                                Some(domain) => {
+                                    sess.destination =
+                                        SocksAddr::Domain(domain, stream.remote_addr().port());
+                                }
+                                None => {
+                                    // Although requests targeting fake IPs are assumed
+                                    // never happen in real network traffic, which are
+                                    // likely caused by poisoned DNS cache records, we
+                                    // still have a chance to sniff the request domain
+                                    // for TLS traffic in dispatcher.
+                                    if stream.remote_addr().port() != 443 {
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
-
                     dispatcher
                         .dispatch_tcp(&mut sess, TcpStream::new(stream))
                         .await;
@@ -187,16 +188,18 @@ impl NetStackImpl {
                         // we assume there must be a paired fake IP, otherwise
                         // we have no idea how to deal with it.
                         SocksAddr::Domain(domain, port) => {
+                            let mut fake_dns = fakedns2.lock().await;
                             // TODO we're doing this for every packet! optimize needed
                             // trace!("downlink querying fake ip for domain {}", &domain);
-                            if let Some(ip) = fakedns2.lock().await.query_fake_ip(&domain) {
-                                SocketAddr::new(ip, port)
-                            } else {
-                                warn!(
-                                    "unexpected domain src addr {}:{} without paired fake IP",
-                                    &domain, &port
-                                );
-                                continue;
+                            match fake_dns.query_fake_ip(&domain) {
+                                Some(ip) => SocketAddr::new(ip, port),
+                                None => {
+                                    warn!(
+                                        "unexpected domain src addr {}:{} without paired fake IP",
+                                        &domain, &port
+                                    );
+                                    continue;
+                                }
                             }
                         }
                     };
@@ -237,7 +240,12 @@ impl NetStackImpl {
                 };
 
                 if dst_addr.port() == 53 {
-                    match fakedns2.lock().await.generate_fake_response(&pkt.data) {
+
+                    let resp = {
+                        let mut fake_dns = fakedns2.lock().await;
+                        fake_dns.generate_fake_response(&pkt.data)
+                    };
+                    match resp {
                         Ok(resp) => {
                             send_udp(lwip_lock.clone(), &dst_addr, &src_addr, pcb, resp.as_ref());
                             continue;
@@ -248,6 +256,29 @@ impl NetStackImpl {
                     }
                 }
 
+                // We're sending UDP packets to a fake IP, and there should be a paired domain,
+                // that said, the application connects a UDP socket with a domain address.
+                // It also means the back packets on this UDP session shall only come from a
+                // single source address.
+                let socks_dst_addr = {
+                    let mut fake_dns = fakedns2.lock().await;
+                    match fake_dns.is_fake_ip(&dst_addr.ip()) {
+                        true => {
+                            // TODO we're doing this for every packet! optimize needed
+                            // trace!("uplink querying domain for fake ip {}", &dst_addr.ip(),);
+                            match fake_dns.query_domain(&dst_addr.ip()) {
+                                Some(domain) => SocksAddr::Domain(domain, dst_addr.port()),
+                                None => {
+                                    // Skip this packet. Requests targeting fake IPs are
+                                    // assumed never happen in real network traffic.
+                                    continue;
+                                }
+                            }
+                        }
+                        false => SocksAddr::Ip(dst_addr),
+                    }
+                };
+                /*
                 // We're sending UDP packets to a fake IP, and there should be a paired domain,
                 // that said, the application connects a UDP socket with a domain address.
                 // It also means the back packets on this UDP session shall only come from a
@@ -264,7 +295,7 @@ impl NetStackImpl {
                     }
                 } else {
                     SocksAddr::Ip(dst_addr)
-                };
+                };*/
 
                 let dgram_src = DatagramSource::new(src_addr, None);
 

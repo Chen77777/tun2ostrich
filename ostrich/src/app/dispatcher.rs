@@ -111,50 +111,67 @@ impl Dispatcher {
             };
 
         let outbound = {
-            let router = self.router.read().await;
-            let outbound = match router.pick_route(sess).await {
+            let route = {
+                let router = self.router.read().await;
+                router.pick_route(sess).await
+            };
+            let outbound = match route {
                 Ok(tag) => {
                     debug!(
                         "picked route [{}] for {} -> {}",
                         tag, &sess.source, &sess.destination
                     );
-                    tag.to_owned()
+                    tag
                 }
                 Err(err) => {
                     trace!("pick route failed: {}", err);
-                    if let Some(tag) = self.outbound_manager.read().await.default_handler() {
-                        debug!(
-                            "picked default route [{}] for {} -> {}",
-                            tag, &sess.source, &sess.destination
-                        );
-                        tag
-                    } else {
-                        warn!("can not find any handlers");
-                        if let Err(e) = lhs.shutdown().await {
+
+                    let handler =  {
+                        let outbound_manager = self.outbound_manager.read().await;
+                        outbound_manager.default_handler()};
+                    match handler {
+                        Some(tag) => {
                             debug!(
-                                "tcp downlink {} <- {} error: {}",
-                                &sess.source, &sess.destination, e,
+                                "picked default route [{}] for {} -> {}",
+                                tag, &sess.source, &sess.destination
                             );
+                            tag
                         }
-                        return;
+                        None => {
+                            warn!("can not find any handlers");
+                            if let Err(e) = lhs.shutdown().await {
+                                debug!(
+                                    "tcp downlink {} <- {} error: {}",
+                                    &sess.source, &sess.destination, e,
+                                );
+                            }
+                            return;
+                        }
                     }
                 }
             };
             outbound
         };
 
-        let h = if let Some(h) = self.outbound_manager.read().await.get(&outbound) {
-            h
-        } else {
-            // FIXME use  the default handler
-            debug!("handler not found");
-            if let Err(e) = lhs.shutdown().await {
-                debug!(
-                    "tcp downlink {} <- {} error: {}",
-                    &sess.source, &sess.destination, e,
-                );
+        let h = {
+            let handler = {
+                let outbound_manager = self.outbound_manager.read().await;
+                outbound_manager.get(&outbound)
+            };
+            match handler {
+                Some(h) => h,
+                None => {
+                    // FIXME use  the default handler
+                    debug!("handler not found");
+                    if let Err(e) = lhs.shutdown().await {
+                        debug!(
+                            "tcp downlink {} <- {} error: {}",
+                            &sess.source, &sess.destination, e,
+                        );
+                    }
+                    return;
+                }
             }
-            return;
         };
 
         let handshake_start = tokio::time::Instant::now();
@@ -444,35 +461,49 @@ impl Dispatcher {
 
     pub async fn dispatch_udp(&self, sess: &Session) -> io::Result<Box<dyn OutboundDatagram>> {
         let outbound = {
-            let router = self.router.read().await;
-            let outbound = match router.pick_route(sess).await {
+            let route = {
+                let router = self.router.read().await;
+                router.pick_route(sess).await
+            };
+            let outbound = match route {
                 Ok(tag) => {
                     debug!(
                         "picked route [{}] for {} -> {}",
                         tag, &sess.source, &sess.destination
                     );
-                    tag.to_owned()
+                    tag
                 }
                 Err(err) => {
                     trace!("pick route failed: {}", err);
-                    if let Some(tag) = self.outbound_manager.read().await.default_handler() {
-                        debug!(
-                            "picked default route [{}] for {} -> {}",
-                            tag, &sess.source, &sess.destination
-                        );
-                        tag
-                    } else {
-                        return Err(io::Error::new(ErrorKind::Other, "no available handler"));
+                    let handler = {
+                        let outbound_manager = self.outbound_manager.read().await;
+                        outbound_manager.default_handler()
+                    };
+                    match handler{
+                        Some(tag) => {
+                            debug!(
+                                "picked default route [{}] for {} -> {}",
+                                tag, &sess.source, &sess.destination
+                            );
+                            tag
+                        }
+                        None => {
+                            return Err(io::Error::new(ErrorKind::Other, "no available handler"));
+                        }
                     }
                 }
             };
             outbound
         };
 
-        let h = if let Some(h) = self.outbound_manager.read().await.get(&outbound) {
-            h
-        } else {
-            return Err(io::Error::new(ErrorKind::Other, "handler not found"));
+        let h = {
+            let outbound_manager = self.outbound_manager.read().await;
+            match outbound_manager.get(&outbound) {
+                Some(h) => h,
+                None => {
+                    return Err(io::Error::new(ErrorKind::Other, "handler not found"));
+                }
+            }
         };
 
         let handshake_start = tokio::time::Instant::now();

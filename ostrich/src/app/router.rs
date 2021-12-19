@@ -506,10 +506,10 @@ impl Router {
         Ok(())
     }
 
-    pub async fn pick_route(&self, sess: &Session) -> Result<&String> {
+    pub async fn pick_route(&self, sess: &Session) -> Result<String> {
         for rule in &self.rules {
             if rule.apply(sess) {
-                return Ok(&rule.target);
+                return Ok(rule.target.to_owned());
             }
         }
         if sess.destination.is_domain() && self.domain_resolve {
@@ -533,7 +533,7 @@ impl Router {
                 );
                 for rule in &self.rules {
                     if rule.apply(&new_sess) {
-                        return Ok(&rule.target);
+                        return Ok(rule.target.to_owned());
                     }
                 }
             }
